@@ -39,16 +39,16 @@ export default function SettingsPage() {
         return;
       }
 
-      const { data: orgData } = await supabase
-        .from("organizations")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: orgData } = await (supabase.from("organizations") as any)
         .select("*, subscription_tiers(*)")
         .eq("owner_user_id", user.id)
         .single();
 
       if (orgData) {
-        setOrg(orgData);
-        setOrgName(orgData.name);
-        setTier(orgData.subscription_tiers);
+        setOrg(orgData as Organization);
+        setOrgName((orgData as Organization).name);
+        setTier(orgData.subscription_tiers as Tier);
       }
       setLoading(false);
     }
@@ -61,8 +61,8 @@ export default function SettingsPage() {
 
     setSaving(true);
     const supabase = createClient();
-    await supabase
-      .from("organizations")
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase.from("organizations") as any)
       .update({ name: orgName })
       .eq("id", org.id);
     setSaving(false);

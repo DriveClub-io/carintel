@@ -50,10 +50,10 @@ export default function KeysPage() {
     const { data } = await supabase
       .from("api_keys")
       .select("id, name, key_prefix, environment, is_active, created_at, last_used_at")
-      .eq("organization_id", org.id)
+      .eq("organization_id", (org as { id: string }).id)
       .order("created_at", { ascending: false });
 
-    setKeys(data || []);
+    setKeys((data as ApiKey[]) || []);
     setLoading(false);
   }
 
@@ -98,8 +98,9 @@ export default function KeysPage() {
     }
 
     // Insert the key
-    const { error } = await supabase.from("api_keys").insert({
-      organization_id: org.id,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const { error } = await (supabase.from("api_keys") as any).insert({
+      organization_id: (org as { id: string }).id,
       name: newKeyName,
       key_hash: keyHash,
       key_prefix: fullKey.slice(0, 12) + "...",
@@ -122,7 +123,8 @@ export default function KeysPage() {
     if (!confirm("Are you sure you want to revoke this API key?")) return;
 
     const supabase = createClient();
-    await supabase.from("api_keys").update({ is_active: false }).eq("id", keyId);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (supabase.from("api_keys") as any).update({ is_active: false }).eq("id", keyId);
     loadKeys();
   }
 

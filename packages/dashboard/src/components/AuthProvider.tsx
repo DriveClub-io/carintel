@@ -37,8 +37,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const supabase = createClient();
 
       // Check if user already has an organization
-      const { data: existingOrg, error: fetchError } = await supabase
-        .from("organizations")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: existingOrg, error: fetchError } = await (supabase.from("organizations") as any)
         .select("id")
         .eq("owner_user_id", currentUser.id)
         .maybeSingle();
@@ -49,7 +49,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       }
 
       if (existingOrg) {
-        return existingOrg.id;
+        return (existingOrg as { id: string }).id;
       }
 
       // Create a new organization for the user
@@ -60,8 +60,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
       const slug = `${userName.toLowerCase().replace(/[^a-z0-9]/g, "-")}-${Date.now()}`;
 
-      const { data: newOrg, error: insertError } = await supabase
-        .from("organizations")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: newOrg, error: insertError } = await (supabase.from("organizations") as any)
         .insert({
           name: `${userName}'s Organization`,
           slug,
@@ -77,7 +77,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         return null;
       }
 
-      return newOrg.id;
+      return (newOrg as { id: string }).id;
     } catch (err) {
       console.error("Unexpected error in ensureOrganization:", err);
       return null;

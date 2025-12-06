@@ -52,20 +52,20 @@ export default function DashboardPage() {
         startOfMonth.setDate(1);
         startOfMonth.setHours(0, 0, 0, 0);
 
-        const { data: usage } = await supabase
-          .from("usage_daily")
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const { data: usage } = await (supabase.from("usage_daily") as any)
           .select("request_count, tokens_used")
-          .eq("organization_id", org.id)
+          .eq("organization_id", (org as { id: string }).id)
           .gte("date", startOfMonth.toISOString().split("T")[0]);
 
-        const totalRequests = usage?.reduce((sum, u) => sum + u.request_count, 0) || 0;
+        const totalRequests = (usage as { request_count: number }[])?.reduce((sum, u) => sum + u.request_count, 0) || 0;
         const monthlyLimit = 1000; // Default limit for now
 
         setStats({
           totalRequests,
           remainingQuota: Math.max(0, monthlyLimit - totalRequests),
           monthlyLimit,
-          recentRequests: usage?.slice(-7).reduce((sum, u) => sum + u.request_count, 0) || 0,
+          recentRequests: (usage as { request_count: number }[])?.slice(-7).reduce((sum, u) => sum + u.request_count, 0) || 0,
         });
       } catch (err) {
         console.error("Error loading stats:", err);

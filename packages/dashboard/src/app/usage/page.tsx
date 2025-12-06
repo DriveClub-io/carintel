@@ -45,8 +45,8 @@ export default function UsagePage() {
         return;
       }
 
-      const { data: org } = await supabase
-        .from("organizations")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: org } = await (supabase.from("organizations") as any)
         .select("id")
         .eq("owner_user_id", user.id)
         .single();
@@ -57,27 +57,27 @@ export default function UsagePage() {
       }
 
       // Get recent logs
-      const { data: logs } = await supabase
-        .from("usage_logs")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: logs } = await (supabase.from("usage_logs") as any)
         .select("id, endpoint, method, source, response_status, latency_ms, created_at")
-        .eq("organization_id", org.id)
+        .eq("organization_id", (org as { id: string }).id)
         .order("created_at", { ascending: false })
         .limit(100);
 
-      setRecentLogs(logs || []);
+      setRecentLogs((logs as UsageLog[]) || []);
 
       // Get daily usage for the last 30 days
       const thirtyDaysAgo = new Date();
       thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
 
-      const { data: daily } = await supabase
-        .from("usage_daily")
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { data: daily } = await (supabase.from("usage_daily") as any)
         .select("date, request_count, endpoint")
-        .eq("organization_id", org.id)
+        .eq("organization_id", (org as { id: string }).id)
         .gte("date", thirtyDaysAgo.toISOString().split("T")[0])
         .order("date", { ascending: true });
 
-      setDailyUsage(daily || []);
+      setDailyUsage((daily as DailyUsage[]) || []);
       setLoading(false);
     }
 
