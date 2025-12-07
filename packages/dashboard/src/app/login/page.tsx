@@ -8,20 +8,33 @@ export default function LoginPage() {
   const [error, setError] = useState<string | null>(null);
 
   async function handleOAuthLogin(provider: "github" | "google") {
+    console.log("[Login] Starting OAuth for:", provider);
     setLoading(provider);
     setError(null);
 
-    const supabase = createClient();
+    try {
+      const supabase = createClient();
+      console.log("[Login] Supabase client created");
 
-    const { error } = await supabase.auth.signInWithOAuth({
-      provider,
-      options: {
-        redirectTo: `${window.location.origin}/auth/callback`,
-      },
-    });
+      const redirectTo = `${window.location.origin}/auth/callback`;
+      console.log("[Login] Redirect URL:", redirectTo);
 
-    if (error) {
-      setError(error.message);
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider,
+        options: {
+          redirectTo,
+        },
+      });
+
+      console.log("[Login] OAuth result:", { data, error });
+
+      if (error) {
+        setError(error.message);
+        setLoading(null);
+      }
+    } catch (err) {
+      console.error("[Login] Exception:", err);
+      setError(String(err));
       setLoading(null);
     }
   }
