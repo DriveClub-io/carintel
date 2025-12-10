@@ -1,0 +1,25 @@
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+
+# Downloaded PDFs (large files)
+manuals/
+
+# marker-pdf test output
+marker_test/
+marker_output/
+
+# Environment files
+.env
+.env.local
+
+# Node modules
+node_modules/
+
+# OS files
+.DS_Store
+
+# Temporary files
+*.tmp
+*.log
