@@ -37,7 +37,7 @@ export function useAuth() {
   return useContext(AuthContext);
 }
 
-const publicPaths = ["/login", "/auth/callback"];
+const publicPaths = ["/login", "/auth/callback", "/invite"];
 const ORG_STORAGE_KEY = "carintel_selected_org";
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
@@ -151,7 +151,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setUser(null);
         setOrganizations([]);
         setOrganizationId(null);
-        if (!publicPaths.includes(pathname) && initialCheckDone) {
+        const isPublicPath = publicPaths.some(path => pathname === path || pathname.startsWith(path + "/"));
+        if (!isPublicPath && initialCheckDone) {
           router.push("/login");
         }
       }
