@@ -1,6 +1,6 @@
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient, SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { handleCors, corsHeaders } from '../_shared/cors.ts';
-import { authenticateRequest, checkRateLimit, logUsage } from '../_shared/auth.ts';
+import { authenticateRequest, checkRateLimit, logUsage, redis } from '../_shared/auth.ts';
 import {
   successResponse,
   errorResponse,
@@ -10,10 +10,24 @@ import {
   internalErrorResponse,
 } from '../_shared/response.ts';
 
-const supabase = createClient(
-  Deno.env.get('SUPABASE_URL') ?? '',
-  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-);
+// Module-level Supabase client singleton (reused across requests)
+let supabaseClient: SupabaseClient | null = null;
+
+function getSupabase(): SupabaseClient {
+  if (!supabaseClient) {
+    supabaseClient = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    );
+  }
+  return supabaseClient;
+}
+
+// Cache TTL constants
+const CACHE_TTL_YEARS = 86400; // 24 hours
+const CACHE_TTL_MAKES = 86400; // 24 hours
+const CACHE_TTL_MODELS = 86400; // 24 hours
+const CACHE_TTL_SEARCH = 3600; // 1 hour
 
 Deno.serve(async (req) => {
   // Handle CORS preflight
@@ -60,7 +74,15 @@ Deno.serve(async (req) => {
     if (req.method !== 'GET') {
       response = errorResponse('method_not_allowed', 'Only GET requests are supported', 405);
     } else if (pathParts[0] === 'vehicles') {
-      if (pathParts[1] === 'vin' && pathParts[2]) {
+      if (pathParts[1] === 'years') {
+        // /vehicles/years - Get all available years
+        response = await handleYears();
+        endpoint = '/vehicles/years';
+      } else if (pathParts[1] === 'search') {
+        // /vehicles/search?q=2024+honda+accord - Search vehicles
+        response = await handleVehicleSearch(url);
+        endpoint = '/vehicles/search';
+      } else if (pathParts[1] === 'vin' && pathParts[2]) {
         // /vehicles/vin/:vin - Decode VIN and return all Car Intel data
         response = await handleVinLookup(pathParts[2], url);
         endpoint = '/vehicles/vin/:vin';
@@ -113,9 +135,9 @@ Deno.serve(async (req) => {
     response = internalErrorResponse();
   }
 
-  // Log usage
+  // Log usage (fire-and-forget - don't await to avoid blocking response)
   const latencyMs = Date.now() - startTime;
-  await logUsage(supabase, {
+  logUsage(getSupabase(), {
     apiKeyId: auth.apiKeyId!,
     organizationId: auth.organizationId!,
     endpoint,
@@ -126,7 +148,7 @@ Deno.serve(async (req) => {
     latencyMs,
     ipAddress: req.headers.get('CF-Connecting-IP') || req.headers.get('X-Forwarded-For')?.split(',')[0],
     userAgent: req.headers.get('User-Agent') || undefined,
-  });
+  }).catch(err => console.error('Usage logging error:', err));
 
   return response;
 });
@@ -265,6 +287,8 @@ async function handleVinLookup(vin: string, url: URL): Promise<Response> {
   if (!/^[A-HJ-NPR-Z0-9]{17}$/.test(vinUpper)) {
     return errorResponse('invalid_vin', 'VIN contains invalid characters');
   }
+
+  const supabase = getSupabase();
 
   try {
     // Decode VIN first
@@ -409,6 +433,8 @@ async function handleLookup(url: URL): Promise<Response> {
     return errorResponse('invalid_params', 'year must be a number');
   }
 
+  const supabase = getSupabase();
+
   // Normalize model name - handle variations like "CR-V" vs "CR V"
   const modelPattern = model.replace(/-/g, '%');
 
@@ -489,6 +515,7 @@ async function handleSpecsSearch(url: URL): Promise<Response> {
   const trim = url.searchParams.get('trim');
   const limit = Math.min(parseInt(url.searchParams.get('limit') || '50'), 100);
 
+  const supabase = getSupabase();
   let query = supabase.from('vehicle_specs').select('*');
 
   if (year) query = query.eq('year', parseInt(year));
@@ -507,6 +534,7 @@ async function handleSpecsSearch(url: URL): Promise<Response> {
 }
 
 async function handleSpecsById(id: string): Promise<Response> {
+  const supabase = getSupabase();
   const { data, error } = await supabase
     .from('vehicle_specs')
     .select('*')
@@ -531,6 +559,8 @@ async function handleWarranty(vehicleId: string): Promise<Response> {
     return errorResponse('invalid_params', 'Vehicle ID must be a valid UUID');
   }
 
+  const supabase = getSupabase();
+
   // Warranties are linked by vehicle_spec_id
   const { data: warranties, error } = await supabase
     .from('vehicle_warranties')
@@ -552,6 +582,8 @@ async function handleWarranty(vehicleId: string): Promise<Response> {
 async function handleMarketValue(vehicleId: string, url: URL): Promise<Response> {
   const condition = url.searchParams.get('condition');
   const mileage = url.searchParams.get('mileage');
+
+  const supabase = getSupabase();
 
   // Get vehicle specs first
   const { data: specs } = await supabase
@@ -611,6 +643,8 @@ async function handleMarketValue(vehicleId: string, url: URL): Promise<Response>
 async function handleMaintenance(vehicleId: string, url: URL): Promise<Response> {
   const currentMileage = url.searchParams.get('current_mileage');
 
+  const supabase = getSupabase();
+
   // Get vehicle specs first
   const { data: specs } = await supabase
     .from('vehicle_specs')
@@ -652,53 +686,177 @@ async function handleMaintenance(vehicleId: string, url: URL): Promise<Response>
 
 async function handleMakes(url: URL): Promise<Response> {
   const year = url.searchParams.get('year');
+  const cacheKey = year ? `vehicles:makes:${year}` : 'vehicles:makes:all';
 
-  let query = supabase
-    .from('vehicle_specs')
-    .select('make');
+  try {
+    // Try cache first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return successResponse(typeof cached === 'string' ? JSON.parse(cached) : cached);
+    }
+  } catch (e) {
+    console.error('Cache read error:', e);
+  }
+
+  const supabase = getSupabase();
+  let makes: string[];
 
   if (year) {
-    query = query.eq('year', parseInt(year));
+    // Query from materialized view (much faster)
+    const { data, error } = await supabase
+      .from('vehicle_makes')
+      .select('make')
+      .eq('year', parseInt(year))
+      .order('make', { ascending: true });
+
+    if (error) {
+      // Fallback to direct query if view doesn't exist
+      const { data: fallbackData, error: fallbackError } = await supabase
+        .from('vehicle_specs')
+        .select('make')
+        .eq('year', parseInt(year));
+
+      if (fallbackError) {
+        console.error('Makes query error:', fallbackError);
+        return internalErrorResponse();
+      }
+
+      makes = [...new Set((fallbackData || []).map(d => d.make))].sort();
+    } else {
+      makes = (data || []).map(d => d.make);
+    }
+  } else {
+    // Get all makes from materialized view
+    const { data, error } = await supabase
+      .from('vehicle_makes')
+      .select('make')
+      .order('make', { ascending: true });
+
+    if (error) {
+      // Fallback
+      const { data: fallbackData, error: fallbackError } = await supabase
+        .from('vehicle_specs')
+        .select('make');
+
+      if (fallbackError) {
+        console.error('Makes query error:', fallbackError);
+        return internalErrorResponse();
+      }
+
+      makes = [...new Set((fallbackData || []).map(d => d.make))].sort();
+    } else {
+      makes = [...new Set((data || []).map(d => d.make))].sort();
+    }
   }
 
-  const { data, error } = await query;
-
-  if (error) {
-    console.error('Makes query error:', error);
-    return internalErrorResponse();
+  // Cache the result
+  try {
+    await redis.set(cacheKey, JSON.stringify(makes), { ex: CACHE_TTL_MAKES });
+  } catch (e) {
+    console.error('Cache write error:', e);
   }
 
-  // Get unique makes
-  const makes = [...new Set((data || []).map(d => d.make))].sort();
   return successResponse(makes);
 }
 
 async function handleModels(make: string, url: URL): Promise<Response> {
   const year = url.searchParams.get('year');
+  const cacheKey = year
+    ? `vehicles:models:${year}:${make.toLowerCase()}`
+    : `vehicles:models:all:${make.toLowerCase()}`;
 
-  let query = supabase
-    .from('vehicle_specs')
-    .select('model')
-    .ilike('make', make);
+  try {
+    // Try cache first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return successResponse(typeof cached === 'string' ? JSON.parse(cached) : cached);
+    }
+  } catch (e) {
+    console.error('Cache read error:', e);
+  }
+
+  const supabase = getSupabase();
+  let models: string[];
 
   if (year) {
-    query = query.eq('year', parseInt(year));
+    // Query from materialized view (much faster)
+    const { data, error } = await supabase
+      .from('vehicle_models')
+      .select('model')
+      .eq('year', parseInt(year))
+      .ilike('make', make)
+      .order('model', { ascending: true });
+
+    if (error) {
+      // Fallback to direct query if view doesn't exist
+      const { data: fallbackData, error: fallbackError } = await supabase
+        .from('vehicle_specs')
+        .select('model')
+        .eq('year', parseInt(year))
+        .ilike('make', make);
+
+      if (fallbackError) {
+        console.error('Models query error:', fallbackError);
+        return internalErrorResponse();
+      }
+
+      models = [...new Set((fallbackData || []).map(d => d.model))].sort();
+    } else {
+      models = (data || []).map(d => d.model);
+    }
+  } else {
+    // Get all models for make from materialized view
+    const { data, error } = await supabase
+      .from('vehicle_models')
+      .select('model')
+      .ilike('make', make)
+      .order('model', { ascending: true });
+
+    if (error) {
+      // Fallback
+      const { data: fallbackData, error: fallbackError } = await supabase
+        .from('vehicle_specs')
+        .select('model')
+        .ilike('make', make);
+
+      if (fallbackError) {
+        console.error('Models query error:', fallbackError);
+        return internalErrorResponse();
+      }
+
+      models = [...new Set((fallbackData || []).map(d => d.model))].sort();
+    } else {
+      models = [...new Set((data || []).map(d => d.model))].sort();
+    }
   }
 
-  const { data, error } = await query;
-
-  if (error) {
-    console.error('Models query error:', error);
-    return internalErrorResponse();
+  // Cache the result
+  try {
+    await redis.set(cacheKey, JSON.stringify(models), { ex: CACHE_TTL_MODELS });
+  } catch (e) {
+    console.error('Cache write error:', e);
   }
 
-  const models = [...new Set((data || []).map(d => d.model))].sort();
   return successResponse(models);
 }
 
 async function handleTrims(make: string, model: string, url: URL): Promise<Response> {
   const year = url.searchParams.get('year');
+  const cacheKey = year
+    ? `vehicles:trims:${year}:${make.toLowerCase()}:${model.toLowerCase()}`
+    : `vehicles:trims:all:${make.toLowerCase()}:${model.toLowerCase()}`;
 
+  try {
+    // Try cache first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return successResponse(typeof cached === 'string' ? JSON.parse(cached) : cached);
+    }
+  } catch (e) {
+    console.error('Cache read error:', e);
+  }
+
+  const supabase = getSupabase();
   let query = supabase
     .from('vehicle_specs')
     .select('trim')
@@ -717,7 +875,214 @@ async function handleTrims(make: string, model: string, url: URL): Promise<Respo
   }
 
   const trims = [...new Set((data || []).filter(d => d.trim).map(d => d.trim))].sort();
+
+  // Cache the result
+  try {
+    await redis.set(cacheKey, JSON.stringify(trims), { ex: CACHE_TTL_MODELS });
+  } catch (e) {
+    console.error('Cache write error:', e);
+  }
+
   return successResponse(trims);
+}
+
+async function handleYears(): Promise<Response> {
+  const cacheKey = 'vehicles:years';
+
+  try {
+    // Try cache first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return successResponse(typeof cached === 'string' ? JSON.parse(cached) : cached);
+    }
+  } catch (e) {
+    console.error('Cache read error:', e);
+  }
+
+  // Query from materialized view (much faster than SELECT DISTINCT on full table)
+  const supabase = getSupabase();
+  const { data, error } = await supabase
+    .from('vehicle_years')
+    .select('year')
+    .order('year', { ascending: false });
+
+  if (error) {
+    // Fallback to direct query if view doesn't exist
+    const { data: fallbackData, error: fallbackError } = await supabase
+      .from('vehicle_specs')
+      .select('year')
+      .order('year', { ascending: false });
+
+    if (fallbackError) {
+      console.error('Years query error:', fallbackError);
+      return internalErrorResponse();
+    }
+
+    const years = [...new Set((fallbackData || []).map(d => d.year))].sort((a, b) => b - a);
+    return successResponse(years);
+  }
+
+  const years = (data || []).map(d => d.year);
+
+  // Cache the result
+  try {
+    await redis.set(cacheKey, JSON.stringify(years), { ex: CACHE_TTL_YEARS });
+  } catch (e) {
+    console.error('Cache write error:', e);
+  }
+
+  return successResponse(years);
+}
+
+async function handleVehicleSearch(url: URL): Promise<Response> {
+  const query = url.searchParams.get('q') || url.searchParams.get('query') || '';
+  const limit = Math.min(parseInt(url.searchParams.get('limit') || '20'), 50);
+
+  if (!query || query.length < 2) {
+    return errorResponse('invalid_params', 'Search query must be at least 2 characters');
+  }
+
+  // Normalize query for cache key
+  const normalizedQuery = query.trim().toLowerCase();
+  const cacheKey = `vehicles:search:${normalizedQuery}:${limit}`;
+
+  try {
+    // Try cache first
+    const cached = await redis.get(cacheKey);
+    if (cached) {
+      return successResponse(typeof cached === 'string' ? JSON.parse(cached) : cached);
+    }
+  } catch (e) {
+    console.error('Cache read error:', e);
+  }
+
+  // Tokenize the query
+  const tokens = normalizedQuery.split(/\s+/);
+
+  // Extract year if present (4-digit number between 1990-2030)
+  let yearFilter: number | null = null;
+  const textTokens: string[] = [];
+
+  for (const token of tokens) {
+    const numVal = parseInt(token);
+    if (token.length === 4 && !isNaN(numVal) && numVal >= 1990 && numVal <= 2030) {
+      yearFilter = numVal;
+    } else if (token.length >= 2) {
+      textTokens.push(token);
+    }
+  }
+
+  const supabase = getSupabase();
+
+  // Try to use the materialized view first (much faster - already deduplicated)
+  let useAutocompleteView = true;
+  let data: any[] | null = null;
+  let error: any = null;
+
+  if (useAutocompleteView) {
+    // Build query on materialized view
+    let dbQuery = supabase
+      .from('vehicle_autocomplete')
+      .select('year, make, model, display_text, sample_vin');
+
+    // Apply year filter if found
+    if (yearFilter) {
+      dbQuery = dbQuery.eq('year', yearFilter);
+    }
+
+    // For text tokens, search in display_text using ILIKE (uses trigram index)
+    // Build a pattern that matches all tokens
+    if (textTokens.length > 0) {
+      // Search for each token in display_text
+      for (const token of textTokens) {
+        const pattern = `%${token}%`;
+        dbQuery = dbQuery.ilike('display_text', pattern);
+      }
+    }
+
+    // Order by year descending, then make, then model
+    dbQuery = dbQuery
+      .order('year', { ascending: false })
+      .order('make', { ascending: true })
+      .order('model', { ascending: true })
+      .limit(limit);
+
+    const result = await dbQuery;
+    data = result.data;
+    error = result.error;
+
+    // If view doesn't exist, fall back to direct query
+    // Handle both PostgreSQL error (42P01) and PostgREST error (PGRST205)
+    if (error && (error.code === '42P01' || error.code === 'PGRST205')) {
+      useAutocompleteView = false;
+    }
+  }
+
+  // Fallback to direct query on vehicle_specs if view doesn't exist
+  if (!useAutocompleteView || (error && (error.code === '42P01' || error.code === 'PGRST205'))) {
+    let dbQuery = supabase
+      .from('vehicle_specs')
+      .select('id, year, make, model, trim, sample_vin');
+
+    if (yearFilter) {
+      dbQuery = dbQuery.eq('year', yearFilter);
+    }
+
+    for (const token of textTokens) {
+      const pattern = `%${token}%`;
+      dbQuery = dbQuery.or(`make.ilike.${pattern},model.ilike.${pattern}`);
+    }
+
+    dbQuery = dbQuery
+      .order('year', { ascending: false })
+      .order('make', { ascending: true })
+      .order('model', { ascending: true })
+      .limit(limit * 3);
+
+    const result = await dbQuery;
+    data = result.data;
+    error = result.error;
+
+    if (error) {
+      console.error('Vehicle search error:', error);
+      return internalErrorResponse();
+    }
+
+    // Deduplicate results (not needed for materialized view)
+    const seen = new Set<string>();
+    const dedupedResults: any[] = [];
+
+    for (const vehicle of (data || [])) {
+      const key = `${vehicle.year}-${vehicle.make}-${vehicle.model}`;
+      if (!seen.has(key)) {
+        seen.add(key);
+        dedupedResults.push({
+          year: vehicle.year,
+          make: vehicle.make,
+          model: vehicle.model,
+          display_text: `${vehicle.year} ${vehicle.make} ${vehicle.model}`,
+          sample_vin: vehicle.sample_vin,
+        });
+        if (dedupedResults.length >= limit) break;
+      }
+    }
+
+    data = dedupedResults;
+  } else if (error) {
+    console.error('Vehicle search error:', error);
+    return internalErrorResponse();
+  }
+
+  const results = data || [];
+
+  // Cache the result (shorter TTL for search results)
+  try {
+    await redis.set(cacheKey, JSON.stringify(results), { ex: CACHE_TTL_SEARCH });
+  } catch (e) {
+    console.error('Cache write error:', e);
+  }
+
+  return successResponse(results);
 }
 
 // ============================================

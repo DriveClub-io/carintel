@@ -1,4 +1,4 @@
-import { createClient } from 'https://esm.sh/@supabase/supabase-js@2';
+import { createClient, SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2';
 import { Ratelimit } from 'https://esm.sh/@upstash/ratelimit@2';
 import { Redis } from 'https://esm.sh/@upstash/redis@1';
 
@@ -14,11 +14,27 @@ export interface AuthResult {
   errorCode?: string;
 }
 
-// Upstash Redis for distributed rate limiting
+// Upstash Redis for distributed rate limiting and caching
 const redis = new Redis({
   url: Deno.env.get('UPSTASH_REDIS_REST_URL') ?? '',
   token: Deno.env.get('UPSTASH_REDIS_REST_TOKEN') ?? '',
 });
+
+// Export redis for use in caching
+export { redis };
+
+// Module-level Supabase client singleton (reused across requests)
+let supabaseClient: SupabaseClient | null = null;
+
+function getSupabase(): SupabaseClient {
+  if (!supabaseClient) {
+    supabaseClient = createClient(
+      Deno.env.get('SUPABASE_URL') ?? '',
+      Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
+    );
+  }
+  return supabaseClient;
+}
 
 // Rate limiters by tier (cached)
 const rateLimiters = new Map<number, Ratelimit>();
@@ -55,15 +71,12 @@ export async function authenticateRequest(req: Request): Promise<AuthResult> {
   const hashArray = Array.from(new Uint8Array(hashBuffer));
   const keyHash = hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
 
-  // Create Supabase client with service role for validation
-  const supabase = createClient(
-    Deno.env.get('SUPABASE_URL') ?? '',
-    Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
-  );
+  // Use module-level Supabase client singleton
+  const supabase = getSupabase();
 
-  // Validate the key using our stored function
+  // Validate the key using our fast stored function (no last_used_at update)
   const { data: validationResult, error } = await supabase
-    .rpc('validate_api_key', { p_key_hash: keyHash });
+    .rpc('validate_api_key_fast', { p_key_hash: keyHash });
 
   if (error) {
     console.error('API key validation error:', error);
