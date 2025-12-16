@@ -83,7 +83,7 @@ export async function GET(
       accepted_at: data.accepted_at,
     });
   } catch (error) {
-    console.error("Error fetching invite:", error);
+    console.error("Error fetching invite:", error instanceof Error ? error.message : error);
     return NextResponse.json(
       { error: "Failed to load invite", code: "INVALID" as const },
       { status: 500 }
